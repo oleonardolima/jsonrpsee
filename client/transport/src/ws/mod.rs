@@ -30,7 +30,9 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
+use futures_util::future::Either;
 use futures_util::io::{BufReader, BufWriter};
+use futures_util::{AsyncRead, AsyncWrite};
 use jsonrpsee_core::client::{CertificateStore, ReceivedMessage, TransportReceiverT, TransportSenderT};
 use jsonrpsee_core::TEN_MB_SIZE_BYTES;
 use jsonrpsee_core::{async_trait, Cow};
@@ -44,21 +46,22 @@ use tokio::net::TcpStream;
 
 pub use http::{uri::InvalidUri, HeaderMap, HeaderValue, Uri};
 pub use soketto::handshake::client::Header;
+use tokio_rustls::TlsConnector;
 
 /// Sending end of WebSocket transport.
 #[derive(Debug)]
-pub struct Sender {
-	inner: connection::Sender<BufReader<BufWriter<EitherStream>>>,
+pub struct Sender<T: AsyncRead + AsyncWrite + Unpin> {
+	inner: connection::Sender<BufReader<BufWriter<T>>>,
 	max_request_size: u32,
 }
 
 /// Receiving end of WebSocket transport.
 #[derive(Debug)]
-pub struct Receiver {
-	inner: connection::Receiver<BufReader<BufWriter<EitherStream>>>,
+pub struct Receiver<T: AsyncRead + AsyncWrite + Unpin> {
+	inner: connection::Receiver<BufReader<BufWriter<T>>>,
 }
 
-/// Builder for a WebSocket transport [`Sender`] and ['Receiver`] pair.
+/// Builder for a WebSocket transport [`Sender`] and [`Receiver`] pair.
 #[derive(Debug)]
 pub struct WsTransportClientBuilder {
 	/// What certificate store to use
@@ -67,9 +70,9 @@ pub struct WsTransportClientBuilder {
 	pub connection_timeout: Duration,
 	/// Custom headers to pass during the HTTP handshake.
 	pub headers: http::HeaderMap,
-	/// Max request payload size
+	/// Max request payload size.
 	pub max_request_size: u32,
-	/// Max response payload size
+	/// Max response payload size.
 	pub max_response_size: u32,
 	/// Max number of redirections.
 	pub max_redirections: usize,
@@ -214,7 +217,7 @@ pub enum WsError {
 }
 
 #[async_trait]
-impl TransportSenderT for Sender {
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> TransportSenderT for Sender<T> {
 	type Error = WsError;
 
 	/// Sends out a request. Returns a `Future` that finishes when the request has been
@@ -251,7 +254,7 @@ impl TransportSenderT for Sender {
 }
 
 #[async_trait]
-impl TransportReceiverT for Receiver {
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> TransportReceiverT for Receiver<T> {
 	type Error = WsError;
 
 	/// Returns a `Future` resolving when the server sent us something back.
@@ -275,29 +278,47 @@ impl TransportReceiverT for Receiver {
 
 impl WsTransportClientBuilder {
 	/// Try to establish the connection.
-	pub async fn build(self, uri: Uri) -> Result<(Sender, Receiver), WsHandshakeError> {
+	pub async fn build(self, uri: Uri) -> Result<(Sender<EitherStream>, Receiver<EitherStream>), WsHandshakeError> {
 		let target: Target = uri.try_into()?;
-		self.try_connect(target).await
+		self.try_connect_over_tcp(target).await
 	}
 
-	async fn try_connect(self, mut target: Target) -> Result<(Sender, Receiver), WsHandshakeError> {
+	pub async fn build_with_stream<T>(
+		&self,
+		uri: Uri,
+		connector: Option<TlsConnector>,
+		data_stream: T,
+	) -> Result<(Sender<T>, Receiver<T>), WsHandshakeError>
+	where
+		T: AsyncRead + AsyncWrite + Unpin,
+	{
+		// TODO: (@oleonardolima) This should also handle the redirections and socketaddrs, or it should be on another fn ?
+		let target: Target = uri.try_into()?;
+		self.try_connect(target, connector, data_stream).await
+	}
+
+	async fn try_connect_over_tcp(
+		self,
+		mut target: Target,
+	) -> Result<(Sender<EitherStream>, Receiver<EitherStream>), WsHandshakeError> {
 		let mut err = None;
 
 		// Only build TLS connector if `wss` in URL.
 		#[cfg(feature = "__tls")]
-		let mut connector = match target._mode {
+		let connector = match target._mode {
 			Mode::Tls => Some(build_tls_config(&self.certificate_store)?),
 			Mode::Plain => None,
 		};
 
+		// TODO: (@oleonardolima) How the parameters usage of clone could be solved ?
 		for _ in 0..self.max_redirections {
-			tracing::debug!("Connecting to target: {:?}", target);
+			tracing::debug!("Connecting to target: {:?}", target.clone());
 
 			// The sockaddrs might get reused if the server replies with a relative URI.
-			let sockaddrs = std::mem::take(&mut target.sockaddrs);
+			let sockaddrs = std::mem::take(&mut target.clone().sockaddrs);
 			for sockaddr in &sockaddrs {
 				#[cfg(feature = "__tls")]
-				let tcp_stream = match connect(*sockaddr, self.connection_timeout, &target.host, connector.as_ref()).await {
+				let tcp_stream = match connect(*sockaddr, self.connection_timeout, target.clone().host.as_str(), connector.clone().as_ref()).await {
 					Ok(stream) => stream,
 					Err(e) => {
 						tracing::debug!("Failed to connect to sockaddr: {:?}", sockaddr);
@@ -316,97 +337,113 @@ impl WsTransportClientBuilder {
 					}
 				};
 
-				let mut client = WsHandshakeClient::new(
-					BufReader::new(BufWriter::new(tcp_stream)),
-					&target.host_header,
-					&target.path_and_query,
-				);
+				self.try_connect(target.clone(), connector.clone(), tcp_stream).await?;
+			}
+		}
+		err.unwrap_or(Err(WsHandshakeError::NoAddressFound(target.clone().host)))
+	}
 
-				let headers: Vec<_> = self
-					.headers
-					.iter()
-					.map(|(key, value)| Header { name: key.as_str(), value: value.as_bytes() })
-					.collect();
-				client.set_headers(&headers);
+	async fn try_connect<T>(
+		&self,
+		mut target: Target,
+		mut connector: Option<TlsConnector>,
+		data_stream: T,
+	) -> Result<(Sender<T>, Receiver<T>), WsHandshakeError>
+	where
+		T: AsyncRead + AsyncWrite + Unpin,
+	{
+		let mut err = None;
 
-				// Perform the initial handshake.
-				match client.handshake().await {
-					Ok(ServerResponse::Accepted { .. }) => {
-						tracing::debug!("Connection established to target: {:?}", target);
-						let mut builder = client.into_builder();
-						builder.set_max_message_size(self.max_response_size as usize);
-						let (sender, receiver) = builder.finish();
-						return Ok((
-							Sender { inner: sender, max_request_size: self.max_request_size },
-							Receiver { inner: receiver },
-						));
-					}
+		// The sockaddrs might get reused if the server replies with a relative URI.
+		let sockaddrs = std::mem::take(&mut target.sockaddrs);
 
-					Ok(ServerResponse::Rejected { status_code }) => {
-						tracing::debug!("Connection rejected: {:?}", status_code);
-						err = Some(Err(WsHandshakeError::Rejected { status_code }));
-					}
-					Ok(ServerResponse::Redirect { status_code, location }) => {
-						tracing::debug!("Redirection: status_code: {}, location: {}", status_code, location);
-						match location.parse::<Uri>() {
-							// redirection with absolute path => need to lookup.
-							Ok(uri) => {
-								// Absolute URI.
-								if uri.scheme().is_some() {
-									target = uri.try_into().map_err(|e| {
-										tracing::error!("Redirection failed: {:?}", e);
-										e
-									})?;
+		let mut client = WsHandshakeClient::new(
+			BufReader::new(BufWriter::new(data_stream)),
+			&target.host_header,
+			&target.path_and_query,
+		);
 
-									// Only build TLS connector if `wss` in redirection URL.
-									#[cfg(feature = "__tls")]
-									match target._mode {
-										Mode::Tls if connector.is_none() => {
-											connector = Some(build_tls_config(&self.certificate_store)?);
-										}
-										Mode::Tls => (),
-										// Drop connector if it was configured previously.
-										Mode::Plain => {
-											connector = None;
-										}
-									};
+		let headers: Vec<_> =
+			self.headers.iter().map(|(key, value)| Header { name: key.as_str(), value: value.as_bytes() }).collect();
+		client.set_headers(&headers);
+
+		// Perform the initial handshake.
+		match client.handshake().await {
+			Ok(ServerResponse::Accepted { .. }) => {
+				tracing::debug!("Connection established to target: {:?}", target);
+				let mut builder = client.into_builder();
+				builder.set_max_message_size(self.max_response_size as usize);
+				let (sender, receiver) = builder.finish();
+				return Ok((
+					Sender { inner: sender, max_request_size: self.max_request_size },
+					Receiver { inner: receiver },
+				));
+			}
+
+			Ok(ServerResponse::Rejected { status_code }) => {
+				tracing::debug!("Connection rejected: {:?}", status_code);
+				err = Some(Err(WsHandshakeError::Rejected { status_code }));
+			}
+			Ok(ServerResponse::Redirect { status_code, location }) => {
+				tracing::debug!("Redirection: status_code: {}, location: {}", status_code, location);
+				match location.parse::<Uri>() {
+					// redirection with absolute path => need to lookup.
+					Ok(uri) => {
+						// Absolute URI.
+						if uri.scheme().is_some() {
+							target = uri.try_into().map_err(|e| {
+								tracing::error!("Redirection failed: {:?}", e);
+								e
+							})?;
+
+							// Only build TLS connector if `wss` in redirection URL.
+							#[cfg(feature = "__tls")]
+							match target._mode {
+								Mode::Tls if connector.is_none() => {
+									connector = Some(build_tls_config(&self.certificate_store)?);
 								}
-								// Relative URI.
-								else {
-									// Replace the entire path_and_query if `location` starts with `/` or `//`.
-									if location.starts_with('/') {
-										target.path_and_query = location;
-									} else {
-										match target.path_and_query.rfind('/') {
-											Some(offset) => {
-												target.path_and_query.replace_range(offset + 1.., &location)
-											}
-											None => {
-												err = Some(Err(WsHandshakeError::Url(
-													format!(
-														"path_and_query: {location}; this is a bug it must contain `/` please open issue"
-													)
-													.into(),
-												)));
-												continue;
-											}
-										};
+								Mode::Tls => (),
+								// Drop connector if it was configured previously.
+								Mode::Plain => {
+									connector = None;
+								}
+							};
+						}
+						// Relative URI.
+						else {
+							// Replace the entire path_and_query if `location` starts with `/` or `//`.
+							if location.starts_with('/') {
+								target.path_and_query = location;
+							} else {
+								match target.path_and_query.rfind('/') {
+									Some(offset) => target.path_and_query.replace_range(offset + 1.., &location),
+									None => {
+										err = Some(Err(WsHandshakeError::Url(
+											format!(
+												"path_and_query: {location}; this is a bug it must contain `/` please open issue"
+											)
+											.into(),
+										)));
+										// TODO: (@oleonardolima) These loop rules should still be handled somehow
+										// continue;
 									}
-									target.sockaddrs = sockaddrs;
-								}
-								break;
+								};
 							}
-							Err(e) => {
-								err = Some(Err(WsHandshakeError::Url(e.to_string().into())));
-							}
-						};
+							target.sockaddrs = sockaddrs;
+						}
+						// TODO: (@oleonardolima) These loop rules should still be handled somehow
+						// break;
 					}
 					Err(e) => {
-						err = Some(Err(e.into()));
+						err = Some(Err(WsHandshakeError::Url(e.to_string().into())));
 					}
 				};
 			}
-		}
+			Err(e) => {
+				err = Some(Err(e.into()));
+			}
+		};
+
 		err.unwrap_or(Err(WsHandshakeError::NoAddressFound(target.host)))
 	}
 }
